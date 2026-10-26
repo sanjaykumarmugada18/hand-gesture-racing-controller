@@ -3,7 +3,12 @@ import cv2
 import time
 import math
 import mediapipe as mp
+
 from pathlib import Path
+
+# Import our previously tested components.
+from keyboard_controller import KeyboardController
+from safety_hotkeys import SafetyHotkeys
 
 
 MODEL_PATH = (
@@ -12,22 +17,13 @@ MODEL_PATH = (
     / "hand_landmarker.task"
 )
 
-# Finger detection thresholds.
+# Finger recognition settings.
 FINGER_OPEN_ANGLE = 160
 THUMB_OPEN_ANGLE = 150
 THUMB_SPREAD_RATIO = 1.15
 
-# New: Gesture confirmation time in seconds.
+# Gesture must remain consistent for 150 ms.
 GESTURE_CONFIRMATION_TIME = 0.15
-
-HAND_CONNECTIONS = [
-    (0, 1), (1, 2), (2, 3), (3, 4),
-    (0, 5), (5, 6), (6, 7), (7, 8),
-    (5, 9), (9, 10), (10, 11), (11, 12),
-    (9, 13), (13, 14), (14, 15), (15, 16),
-    (13, 17), (17, 18), (18, 19), (19, 20),
-    (0, 17)
-]
 
 FINGER_NAMES = [
     "Thumb", "Index", "Middle", "Ring", "Pinky"
@@ -40,8 +36,19 @@ DRIVING_COMMANDS = {
     "BRAKE"
 }
 
+HAND_CONNECTIONS = [
+    (0, 1), (1, 2), (2, 3), (3, 4),
+    (0, 5), (5, 6), (6, 7), (7, 8),
+    (5, 9), (9, 10), (10, 11), (11, 12),
+    (9, 13), (13, 14), (14, 15), (15, 16),
+    (13, 17), (17, 18), (18, 19), (19, 20),
+    (0, 17)
+]
+
 
 def landmark_distance(a, b, width, height):
+    """Calculate pixel distance between landmarks."""
+
     dx = (a.x - b.x) * width
     dy = (a.y - b.y) * height
 
@@ -72,7 +79,7 @@ def joint_angle(a, b, c, width, height):
 
 
 def detect_finger_states(landmarks, width, height):
-    """Detect which fingers are extended."""
+    """Determine which individual fingers are open."""
 
     states = {}
 
@@ -84,6 +91,7 @@ def detect_finger_states(landmarks, width, height):
     }
 
     for name, (mcp, pip, dip, tip) in fingers.items():
+
         pip_angle = joint_angle(
             landmarks[mcp],
             landmarks[pip],
@@ -113,14 +121,14 @@ def detect_finger_states(landmarks, width, height):
         height
     )
 
-    thumb_tip_distance = landmark_distance(
+    tip_distance = landmark_distance(
         landmarks[4],
         landmarks[17],
         width,
         height
     )
 
-    thumb_base_distance = landmark_distance(
+    base_distance = landmark_distance(
         landmarks[2],
         landmarks[17],
         width,
@@ -129,16 +137,15 @@ def detect_finger_states(landmarks, width, height):
 
     states["Thumb"] = (
         thumb_angle >= THUMB_OPEN_ANGLE
-        and thumb_base_distance > 0
-        and thumb_tip_distance
-        > thumb_base_distance * THUMB_SPREAD_RATIO
+        and base_distance > 0
+        and tip_distance > base_distance * THUMB_SPREAD_RATIO
     )
 
     return states
 
 
 def recognize_gesture(states, hand_label):
-    """Convert finger combinations into driving commands."""
+    """Translate finger combinations into commands."""
 
     if hand_label not in ("Left", "Right"):
         return "UNKNOWN"
@@ -151,7 +158,7 @@ def recognize_gesture(states, hand_label):
     if pattern == (False, False, False, False, False):
         return "BRAKE"
 
-    # Open palm.
+    # Fully open palm.
     if pattern == (True, True, True, True, True):
         return "NEUTRAL"
 
@@ -163,26 +170,28 @@ def recognize_gesture(states, hand_label):
     if pattern == (False, True, True, False, False):
         if hand_label == "Right":
             return "ACCELERATE + RIGHT"
+
         return "ACCELERATE + LEFT"
 
     # Index + thumb.
     if pattern == (True, True, False, False, False):
         if hand_label == "Right":
             return "ACCELERATE + LEFT"
+
         return "ACCELERATE + RIGHT"
 
     return "UNKNOWN"
 
 
 def get_control_state(result, width, height):
-    """Read the current raw gesture and active hand."""
+    """Obtain command from exactly one detected hand."""
 
-    hand_count = len(result.hand_landmarks)
+    count = len(result.hand_landmarks)
 
-    if hand_count == 0:
+    if count == 0:
         return "TRACKING LOST", None, None
 
-    if hand_count > 1:
+    if count > 1:
         return "MULTIPLE HANDS", None, None
 
     if not result.handedness or not result.handedness[0]:
@@ -206,22 +215,16 @@ def get_control_state(result, width, height):
 
 
 class GestureStabilizer:
-    """
-    Confirm valid driving gestures before accepting them.
-
-    Unsafe or unavailable input immediately clears
-    the active driving command.
-    """
+    """Confirm driving gestures and reset unsafe states."""
 
     def __init__(self, confirmation_time=0.15):
         self.confirmation_time = confirmation_time
+        self.reset()
 
+    def reset(self):
         self.active_command = "NEUTRAL"
         self.active_hand = None
-
-        self.pending_command = None
-        self.pending_hand = None
-        self.pending_since = None
+        self.clear_pending()
 
     def clear_pending(self):
         self.pending_command = None
@@ -229,52 +232,35 @@ class GestureStabilizer:
         self.pending_since = None
 
     def update(self, raw_command, hand_label, now):
-        """
-        Return (stable_command, status).
 
-        This class does not send keyboard inputs.
-        """
-
-        # Safety: Unavailable or invalid input takes
-        # effect immediately, without waiting.
+        # Tracking errors and invalid gestures immediately
+        # clear the active driving command.
         if raw_command in (
             "TRACKING LOST",
             "MULTIPLE HANDS",
             "UNKNOWN"
         ):
-            self.active_command = "NEUTRAL"
-            self.active_hand = None
-            self.clear_pending()
-
+            self.reset()
             return raw_command, "SAFETY RESET"
 
-        # Open palm means release movement immediately.
+        # Neutral takes effect immediately.
         if raw_command == "NEUTRAL":
-            self.active_command = "NEUTRAL"
-            self.active_hand = hand_label
-            self.clear_pending()
-
+            self.reset()
             return "NEUTRAL", "STABLE"
 
-        # Reject unexpected commands safely.
         if raw_command not in DRIVING_COMMANDS:
-            self.active_command = "NEUTRAL"
-            self.active_hand = None
-            self.clear_pending()
-
+            self.reset()
             return "UNKNOWN", "SAFETY RESET"
 
-        # If the command and hand are already accepted,
-        # continue using that stable command.
+        # Continue an already stable gesture.
         if (
             raw_command == self.active_command
             and hand_label == self.active_hand
         ):
             self.clear_pending()
-
             return self.active_command, "STABLE"
 
-        # New gesture or different controlling hand.
+        # Start confirmation of a new gesture.
         if (
             raw_command != self.pending_command
             or hand_label != self.pending_hand
@@ -283,20 +269,18 @@ class GestureStabilizer:
             self.pending_hand = hand_label
             self.pending_since = now
 
-            # Do not maintain the previous driving key
-            # while a different gesture is being confirmed.
+            # Release previous driving input immediately
+            # while confirming the new gesture.
             self.active_command = "NEUTRAL"
             self.active_hand = None
 
             return "NEUTRAL", "CONFIRMING"
 
-        # Check how long the same gesture has persisted.
         elapsed = now - self.pending_since
 
         if elapsed >= self.confirmation_time:
             self.active_command = self.pending_command
             self.active_hand = self.pending_hand
-
             self.clear_pending()
 
             return self.active_command, "STABLE"
@@ -305,7 +289,7 @@ class GestureStabilizer:
 
 
 def draw_hand_landmarks(frame, landmarks):
-    """Draw original-image landmarks on mirrored preview."""
+    """Draw hand skeleton on the mirrored preview."""
 
     height, width, _ = frame.shape
     points = []
@@ -314,8 +298,7 @@ def draw_hand_landmarks(frame, landmarks):
         x = int(landmark.x * width)
         y = int(landmark.y * height)
 
-        display_x = width - 1 - x
-        points.append((display_x, y))
+        points.append((width - 1 - x, y))
 
     for start, end in HAND_CONNECTIONS:
         cv2.line(
@@ -336,11 +319,27 @@ def draw_hand_landmarks(frame, landmarks):
         )
 
 
+def draw_text(frame, text, x, y, color, scale=0.55):
+    """Small helper for webcam status labels."""
+
+    cv2.putText(
+        frame,
+        text,
+        (x, y),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        scale,
+        color,
+        2
+    )
+
+
 def main():
-    print("Starting Hand Gesture Racing Controller...")
+    print("======================================")
+    print(" Hand Gesture Racing Controller")
+    print("======================================")
 
     if not MODEL_PATH.is_file():
-        print(f"Model not found: {MODEL_PATH}")
+        print(f"Missing model: {MODEL_PATH}")
         return
 
     options = mp.tasks.vision.HandLandmarkerOptions(
@@ -353,45 +352,107 @@ def main():
         min_tracking_confidence=0.5
     )
 
-    camera = cv2.VideoCapture(0)
-
-    if not camera.isOpened():
-        print("Error: Unable to access webcam.")
-        return
-
-    # NEW: Create our gesture stabilizer.
+    # Our three integration components.
     stabilizer = GestureStabilizer(
         GESTURE_CONFIRMATION_TIME
     )
 
-    print("Webcam started successfully!")
-    print("Gesture stabilization enabled.")
-    print("No keyboard inputs will be sent.")
-    print("Press Q to exit.")
+    controller = KeyboardController()
+    hotkeys = SafetyHotkeys()
 
-    fps_start_time = time.perf_counter()
-    frame_count = 0
+    # Software emergency-stop latch.
+    emergency_stopped = False
+
+    camera = None
+
     fps = 0.0
+    frame_count = 0
+    fps_start_time = time.perf_counter()
 
     video_start_time = time.perf_counter()
     last_timestamp_ms = -1
 
+    print("\nControls:")
+    print("F8  - Enable / Disable")
+    print("F9  - Emergency stop")
+    print("F10 - Exit")
+    print("Q   - Exit (when webcam window is focused)")
+
+    print("\nController starts DISABLED.")
+    print("Open palm before enabling control.")
+
     try:
+        camera = cv2.VideoCapture(0)
+
+        if not camera.isOpened():
+            print("Error: Could not open webcam.")
+            return
+
+        hotkeys.start()
+
+        print("\nWebcam and safety listener started.")
+
         with mp.tasks.vision.HandLandmarker.create_from_options(
             options
         ) as landmarker:
 
             while True:
-                # Capture original webcam frame.
+
+                # ------------------------------------
+                # 1. Handle global safety shortcuts.
+                # ------------------------------------
+
+                if hotkeys.exit_requested.is_set():
+                    print("\nF10: Exit requested.")
+                    break
+
+                # Emergency stop takes priority over F8.
+                if hotkeys.stop_requested.is_set():
+                    hotkeys.stop_requested.clear()
+                    hotkeys.toggle_requested.clear()
+
+                    emergency_stopped = True
+
+                    controller.emergency_stop()
+                    stabilizer.reset()
+
+                    print(
+                        "Emergency stop locked. "
+                        "Restart required to re-enable."
+                    )
+
+                if hotkeys.toggle_requested.is_set():
+                    hotkeys.toggle_requested.clear()
+
+                    if emergency_stopped:
+                        print(
+                            "Cannot enable: emergency stop active."
+                        )
+
+                    elif controller.enabled:
+                        controller.disable()
+                        stabilizer.reset()
+
+                    else:
+                        stabilizer.reset()
+                        controller.enable()
+
+                # ------------------------------------
+                # 2. Capture webcam frame.
+                # ------------------------------------
+
                 success, original_frame = camera.read()
 
                 if not success:
-                    print("Failed to capture frame.")
+                    print("Webcam frame capture failed.")
                     break
 
                 height, width, _ = original_frame.shape
 
-                # Convert BGR into RGB.
+                # ------------------------------------
+                # 3. MediaPipe hand detection.
+                # ------------------------------------
+
                 rgb_frame = cv2.cvtColor(
                     original_frame,
                     cv2.COLOR_BGR2RGB
@@ -402,7 +463,6 @@ def main():
                     data=rgb_frame
                 )
 
-                # MediaPipe requires increasing timestamps.
                 timestamp_ms = int(
                     (time.perf_counter() - video_start_time)
                     * 1000
@@ -420,25 +480,25 @@ def main():
                     timestamp_ms
                 )
 
-                # Mirror only the preview.
                 display_frame = cv2.flip(
                     original_frame,
                     1
                 )
 
-                # Draw hand skeletons.
                 for landmarks in result.hand_landmarks:
                     draw_hand_landmarks(
                         display_frame,
                         landmarks
                     )
 
-                # Read raw command from finger gestures.
+                # ------------------------------------
+                # 4. Recognize driving gesture.
+                # ------------------------------------
+
                 raw_command, hand_label, finger_states = (
                     get_control_state(result, width, height)
                 )
 
-                # NEW: Stabilize command using elapsed time.
                 stable_command, stability_status = (
                     stabilizer.update(
                         raw_command,
@@ -447,132 +507,166 @@ def main():
                     )
                 )
 
-                # Calculate FPS.
+                # ------------------------------------
+                # 5. Game keyboard integration.
+                # ------------------------------------
+
+                # Recheck safety requests before
+                # sending new keyboard events.
+                if hotkeys.exit_requested.is_set():
+                    break
+
+                if hotkeys.stop_requested.is_set():
+                    hotkeys.stop_requested.clear()
+                    hotkeys.toggle_requested.clear()
+
+                    emergency_stopped = True
+
+                    controller.emergency_stop()
+                    stabilizer.reset()
+
+                    print("Emergency stop activated.")
+
+                if controller.enabled and not emergency_stopped:
+                    controller.update(stable_command)
+                else:
+                    # Disabled state never sends driving keys.
+                    stabilizer.reset()
+
+                # ------------------------------------
+                # 6. Update FPS.
+                # ------------------------------------
+
                 frame_count += 1
-                current_time = time.perf_counter()
-                elapsed_time = current_time - fps_start_time
+                now = time.perf_counter()
+                elapsed = now - fps_start_time
 
-                if elapsed_time >= 1.0:
-                    fps = frame_count / elapsed_time
+                if elapsed >= 1.0:
+                    fps = frame_count / elapsed
                     frame_count = 0
-                    fps_start_time = current_time
+                    fps_start_time = now
 
-                # Draw camera information.
-                cv2.putText(
+                # ------------------------------------
+                # 7. Draw the information overlay.
+                # ------------------------------------
+
+                green = (0, 255, 0)
+                white = (255, 255, 255)
+                orange = (0, 165, 255)
+                red = (0, 0, 255)
+
+                draw_text(
                     display_frame,
-                    f"Resolution: {width} x {height}",
-                    (20, 35),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.6,
-                    (0, 255, 0),
-                    2
+                    f"FPS: {fps:.1f} | Hands: {len(result.hand_landmarks)}",
+                    15, 30, green
                 )
 
-                cv2.putText(
+                if emergency_stopped:
+                    mode = "EMERGENCY STOP"
+                    mode_color = red
+
+                elif controller.enabled:
+                    mode = "ENABLED"
+                    mode_color = green
+
+                else:
+                    mode = "DISABLED"
+                    mode_color = orange
+
+                draw_text(
                     display_frame,
-                    f"FPS: {fps:.2f}",
-                    (20, 65),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.6,
-                    (0, 255, 0),
-                    2
+                    f"CONTROL: {mode}",
+                    15, 60, mode_color
                 )
 
-                cv2.putText(
+                draw_text(
                     display_frame,
-                    f"Hands Detected: {len(result.hand_landmarks)}",
-                    (20, 95),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.6,
-                    (0, 255, 0),
-                    2
-                )
-
-                active_hand = hand_label or "None"
-
-                cv2.putText(
-                    display_frame,
-                    f"Active Hand: {active_hand}",
-                    (20, 125),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.6,
-                    (255, 255, 255),
-                    2
+                    f"Hand: {hand_label or 'None'}",
+                    15, 90, white
                 )
 
                 if finger_states is not None:
-                    finger_text = "  ".join(
+                    finger_text = " ".join(
                         f"{name[0]}:{int(finger_states[name])}"
                         for name in FINGER_NAMES
                     )
 
-                    cv2.putText(
+                    draw_text(
                         display_frame,
                         finger_text,
-                        (20, 155),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.48,
-                        (255, 255, 255),
-                        1
+                        15, 120, white, 0.46
                     )
 
-                # NEW: Display raw and accepted commands.
-                cv2.putText(
+                draw_text(
                     display_frame,
                     f"RAW: {raw_command}",
-                    (20, height - 100),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.55,
-                    (255, 255, 255),
-                    2
+                    15, height - 115, white, 0.5
                 )
 
-                cv2.putText(
+                draw_text(
                     display_frame,
                     f"STATUS: {stability_status}",
-                    (20, height - 70),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.55,
-                    (0, 255, 255),
-                    2
+                    15, height - 85, orange, 0.5
                 )
 
-                # Green when actively driving;
-                # otherwise orange.
-                if stable_command in DRIVING_COMMANDS:
-                    command_color = (0, 255, 0)
+                # Show what is actually allowed
+                # to reach the keyboard controller.
+                if controller.enabled and not emergency_stopped:
+                    output_command = stable_command
                 else:
-                    command_color = (0, 165, 255)
+                    output_command = "NEUTRAL"
 
-                cv2.putText(
+                draw_text(
                     display_frame,
-                    f"COMMAND: {stable_command}",
-                    (20, height - 35),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.65,
-                    command_color,
-                    2
+                    f"OUTPUT: {output_command}",
+                    15, height - 55,
+                    green if output_command in DRIVING_COMMANDS
+                    else orange,
+                    0.57
+                )
+
+                draw_text(
+                    display_frame,
+                    "F8 Toggle | F9 Stop | F10 Exit",
+                    15, height - 18, white, 0.48
                 )
 
                 cv2.imshow(
-                    "Hand Gesture Controller - Stabilized",
+                    "Gesture Racing Controller - LIVE",
                     display_frame
                 )
 
+                # Q works when OpenCV has focus.
                 if cv2.waitKey(1) & 0xFF == ord("q"):
-                    print("Exiting...")
+                    print("\nQ: Exit requested.")
                     break
 
-    finally:
-        # Clear the internal command state on exit.
-        stabilizer.active_command = "NEUTRAL"
-        stabilizer.active_hand = None
-        stabilizer.clear_pending()
+    except KeyboardInterrupt:
+        print("\nInterrupted from terminal.")
 
-        camera.release()
+    except Exception as exc:
+        print(f"\nController error: {exc}")
+
+    finally:
+        # The controller should not remain enabled.
+        # Attempt key release even on errors.
+        try:
+            controller.disable()
+        except Exception as exc:
+            print(f"Key release warning: {exc}")
+
+        try:
+            hotkeys.close()
+        except Exception as exc:
+            print(f"Hotkey listener warning: {exc}")
+
+        if camera is not None:
+            camera.release()
+
         cv2.destroyAllWindows()
 
-        print("Webcam released and windows closed.")
+        print("Webcam closed.")
+        print("Controller cleanup completed.")
 
 
 if __name__ == "__main__":
